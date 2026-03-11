@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # --- Enums ---
@@ -79,6 +79,23 @@ class ModuleNode(BaseModel):
     classes: list[str] = Field(default_factory=list)
     pagerank_score: float = 0.0
 
+    @field_validator("complexity_score")
+    @classmethod
+    def complexity_non_negative(cls, v: float) -> float:
+        return max(0.0, v)
+
+    @field_validator("comment_ratio")
+    @classmethod
+    def comment_ratio_bounded(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path must not be empty")
+        return v
+
 
 class DatasetNode(BaseModel):
     """Represents a data source/sink (table, file, stream)."""
@@ -90,6 +107,13 @@ class DatasetNode(BaseModel):
     owner: Optional[str] = None
     is_source_of_truth: bool = False
 
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("dataset name must not be empty")
+        return v
+
 
 class FunctionNode(BaseModel):
     """Represents a function or method."""
@@ -100,6 +124,13 @@ class FunctionNode(BaseModel):
     purpose_statement: Optional[str] = None
     call_count_within_repo: int = 0
     is_public_api: bool = False
+
+    @field_validator("qualified_name")
+    @classmethod
+    def qualified_name_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("qualified_name must not be empty")
+        return v
 
 
 class TransformationNode(BaseModel):
@@ -125,6 +156,11 @@ class GraphEdge(BaseModel):
     edge_type: EdgeType
     weight: float = 1.0
     metadata: dict = Field(default_factory=dict)
+
+    @field_validator("weight")
+    @classmethod
+    def weight_positive(cls, v: float) -> float:
+        return max(0.0, v)
 
 
 # --- Graph Container ---
