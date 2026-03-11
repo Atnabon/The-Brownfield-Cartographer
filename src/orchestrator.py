@@ -194,6 +194,13 @@ class Orchestrator:
             for path, count in high_vel:
                 console.print(f"    {count} commits  {path}")
 
+        # 80/20 velocity analysis
+        hot_files = results.get("high_velocity_80_20", [])
+        if hot_files:
+            console.print(
+                f"  [bold]80/20 Velocity:[/] {len(hot_files)} files account for 80%+ of commits"
+            )
+
     def _print_hydrologist_summary(self, results: dict):
         """Print a summary of Hydrologist findings."""
         console.print(f"  [green]✓[/] Found [bold]{len(results['datasets'])}[/] datasets")

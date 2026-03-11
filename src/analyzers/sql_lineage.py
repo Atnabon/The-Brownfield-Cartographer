@@ -22,6 +22,7 @@ class SQLTableReference:
     schema_name: str | None = None
     database: str | None = None
     alias: str | None = None
+    operation: str = "read"  # 'read' or 'write'
 
     @property
     def full_name(self) -> str:
@@ -44,6 +45,8 @@ class SQLLineageResult:
     ctes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     raw_sql: str = ""
+    line_range: tuple[int, int] = (0, 0)
+    operation_type: str = "select"  # select, create, insert, merge, delete
 
 
 class SQLLineageAnalyzer:
@@ -111,14 +114,34 @@ class SQLLineageAnalyzer:
                     raw_sql=sql[:500],
                 )]
 
-        for stmt in statements:
+        for stmt_idx, stmt in enumerate(statements):
             if stmt is None:
                 continue
 
             result = SQLLineageResult(source_file=source_file, raw_sql=sql[:500])
 
+            # Determine operation type and line range
+            if isinstance(stmt, exp.Create):
+                result.operation_type = "create"
+            elif isinstance(stmt, exp.Insert):
+                result.operation_type = "insert"
+            elif isinstance(stmt, exp.Merge):
+                result.operation_type = "merge"
+            elif isinstance(stmt, exp.Delete):
+                result.operation_type = "delete"
+            else:
+                result.operation_type = "select"
+
+            # Estimate line range from statement position in the SQL
+            stmt_sql = stmt.sql(dialect=dialect) if stmt else ""
+            start_pos = sql.find(stmt_sql[:50]) if stmt_sql else -1
+            if start_pos >= 0:
+                start_line = sql[:start_pos].count("\n") + 1
+                end_line = start_line + stmt_sql.count("\n")
+                result.line_range = (start_line, end_line)
+
             try:
-                # Extract CTEs
+                # Extract CTEs (including nested)
                 for cte in stmt.find_all(exp.CTE):
                     alias_node = cte.args.get("alias")
                     if alias_node:
@@ -145,6 +168,7 @@ class SQLLineageAnalyzer:
                         name=table_name,
                         schema_name=schema,
                         database=db,
+                        operation="read",
                     )
                     source_tables.add(ref.full_name)
                     result.source_tables.append(ref)
@@ -155,15 +179,13 @@ class SQLLineageAnalyzer:
                     if schema_expr:
                         table = schema_expr.find(exp.Table)
                         if table:
-                            ref = SQLTableReference(name=table.name)
+                            ref = SQLTableReference(name=table.name, operation="write")
                             result.target_tables.append(ref)
                     else:
                         table = stmt.find(exp.Table)
                         if table and table.name:
-                            # The first table in CREATE is the target
-                            ref = SQLTableReference(name=table.name)
+                            ref = SQLTableReference(name=table.name, operation="write")
                             result.target_tables.append(ref)
-                            # Remove from source tables if present
                             result.source_tables = [
                                 t for t in result.source_tables
                                 if t.full_name != ref.full_name
@@ -172,12 +194,40 @@ class SQLLineageAnalyzer:
                 if isinstance(stmt, (exp.Insert,)):
                     table = stmt.find(exp.Table)
                     if table and table.name:
-                        ref = SQLTableReference(name=table.name)
+                        ref = SQLTableReference(name=table.name, operation="write")
                         result.target_tables.append(ref)
                         result.source_tables = [
                             t for t in result.source_tables
                             if t.full_name != ref.full_name
                         ]
+
+                # Handle MERGE statements
+                if isinstance(stmt, exp.Merge):
+                    # First table in MERGE is the target
+                    tables_found = list(stmt.find_all(exp.Table))
+                    if tables_found:
+                        ref = SQLTableReference(
+                            name=tables_found[0].name, operation="write",
+                        )
+                        result.target_tables.append(ref)
+                        # Remaining tables are sources
+                        for tbl in tables_found[1:]:
+                            if tbl.name and tbl.name not in result.ctes:
+                                ref = SQLTableReference(
+                                    name=tbl.name, operation="read",
+                                )
+                                result.source_tables.append(ref)
+
+                # Handle subqueries — tables inside Subquery nodes
+                for subq in stmt.find_all(exp.Subquery):
+                    for table in subq.find_all(exp.Table):
+                        if table.name and table.name not in result.ctes:
+                            already = {t.full_name for t in result.source_tables}
+                            ref = SQLTableReference(
+                                name=table.name, operation="read",
+                            )
+                            if ref.full_name not in already:
+                                result.source_tables.append(ref)
 
             except Exception as e:
                 result.errors.append(f"Error extracting lineage: {e}")

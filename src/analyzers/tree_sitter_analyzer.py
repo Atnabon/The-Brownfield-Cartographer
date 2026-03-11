@@ -460,7 +460,7 @@ class TreeSitterAnalyzer:
         self, file_path: Path, content: str, lines: list[str],
         loc: int, blank: int, comments: int,
     ) -> ModuleAnalysis:
-        """Basic SQL file analysis."""
+        """SQL file analysis using tree-sitter AST or regex fallback."""
         analysis = ModuleAnalysis(
             path=str(file_path),
             language=Language.SQL,
@@ -469,7 +469,14 @@ class TreeSitterAnalyzer:
             comment_lines=comments,
         )
 
-        # Extract table references with regex
+        if self._ts_available and Language.SQL in self._parsers:
+            try:
+                self._analyze_sql_ts(content, analysis)
+                return analysis
+            except Exception as e:
+                logger.debug(f"tree-sitter SQL parse failed for {file_path}, falling back: {e}")
+
+        # Regex fallback for table references
         tables = set()
         # FROM / JOIN patterns
         for match in re.finditer(
@@ -493,11 +500,72 @@ class TreeSitterAnalyzer:
 
         return analysis
 
+    def _analyze_sql_ts(self, content: str, analysis: ModuleAnalysis):
+        """Parse SQL using tree-sitter AST to extract structural elements."""
+        parser = self._parsers[Language.SQL]
+        tree = parser.parse(content.encode("utf-8"))
+        root = tree.root_node
+
+        tables = set()
+        # Walk the AST to find table references, CTEs, and query structure
+        self._walk_sql_node(root, content, tables, analysis)
+
+        for table in tables:
+            analysis.imports.append(ImportInfo(module=table, names=[], is_relative=False))
+
+    def _walk_sql_node(self, node, content: str, tables: set, analysis: ModuleAnalysis):
+        """Recursively walk SQL AST to extract structural elements."""
+        node_type = node.type
+
+        # Extract table/relation references
+        if node_type in ("relation", "table_reference", "object_reference"):
+            text = content[node.start_byte:node.end_byte].strip('`"\' ')
+            if text and text.upper() not in (
+                "SELECT", "WHERE", "SET", "VALUES", "TABLE", "AS", "ON",
+            ):
+                tables.add(text)
+
+        # Extract CTE definitions as function-like entries
+        if node_type in ("cte", "common_table_expression"):
+            text = content[node.start_byte:node.end_byte]
+            # Get CTE name from first identifier child
+            for child in node.children:
+                if child.type in ("identifier", "name"):
+                    cte_name = content[child.start_byte:child.end_byte].strip()
+                    analysis.functions.append(FunctionInfo(
+                        name=f"CTE:{cte_name}",
+                        signature=f"WITH {cte_name} AS (...)",
+                        line_start=node.start_point[0] + 1,
+                        line_end=node.end_point[0] + 1,
+                        is_public=True,
+                    ))
+                    break
+
+        # Extract CREATE statements
+        if node_type in ("create_table_statement", "create_view_statement", "create_statement"):
+            text = content[node.start_byte:node.end_byte]
+            match = re.match(
+                r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([`"\'?\w.]+)',
+                text, re.IGNORECASE,
+            )
+            if match:
+                target = match.group(1).strip('`"\'')
+                analysis.functions.append(FunctionInfo(
+                    name=f"CREATE:{target}",
+                    signature=f"CREATE {target}",
+                    line_start=node.start_point[0] + 1,
+                    line_end=node.end_point[0] + 1,
+                    is_public=True,
+                ))
+
+        for child in node.children:
+            self._walk_sql_node(child, content, tables, analysis)
+
     def _analyze_yaml(
         self, file_path: Path, content: str, lines: list[str],
         loc: int, blank: int, comments: int,
     ) -> ModuleAnalysis:
-        """Basic YAML file analysis."""
+        """YAML file analysis extracting pipeline-relevant key hierarchies."""
         analysis = ModuleAnalysis(
             path=str(file_path),
             language=Language.YAML,
@@ -506,19 +574,96 @@ class TreeSitterAnalyzer:
             comment_lines=comments,
         )
 
-        # Extract top-level keys
+        try:
+            import yaml as pyyaml
+            data = pyyaml.safe_load(content)
+            if isinstance(data, dict):
+                self._extract_yaml_keys(data, "", lines, analysis)
+        except Exception:
+            # Fallback: extract top-level keys via regex
+            for i, line in enumerate(lines):
+                match = re.match(r'^(\w[\w_-]*):', line)
+                if match:
+                    analysis.functions.append(FunctionInfo(
+                        name=match.group(1),
+                        signature=f"key: {match.group(1)}",
+                        line_start=i + 1,
+                        line_end=i + 1,
+                        is_public=True,
+                    ))
+
+        # Detect pipeline-specific patterns in the YAML
+        fname = Path(file_path).name.lower()
+        if any(kw in fname for kw in ("dag", "pipeline", "workflow", "schedule")):
+            analysis.imports.append(ImportInfo(
+                module=f"pipeline_config:{fname}", names=[], is_relative=False,
+            ))
+
+        # Detect dbt schema references
+        if isinstance(data, dict) if 'data' in dir() else False:
+            pass  # handled by _extract_yaml_keys
         for line in lines:
-            match = re.match(r'^(\w[\w_-]*):', line)
-            if match:
-                analysis.functions.append(FunctionInfo(
-                    name=match.group(1),
-                    signature=f"key: {match.group(1)}",
-                    line_start=lines.index(line) + 1,
-                    line_end=lines.index(line) + 1,
-                    is_public=True,
+            ref_match = re.search(r"ref\(\s*['\"](\w+)['\"]\s*\)", line)
+            if ref_match:
+                analysis.imports.append(ImportInfo(
+                    module=f"dbt_ref:{ref_match.group(1)}", names=[], is_relative=False,
                 ))
 
         return analysis
+
+    def _extract_yaml_keys(
+        self, data: dict, prefix: str, lines: list[str], analysis: ModuleAnalysis,
+        depth: int = 0, max_depth: int = 3,
+    ):
+        """Recursively extract YAML key hierarchies relevant to pipeline config."""
+        if depth > max_depth:
+            return
+
+        # Pipeline-relevant keys to track at any depth
+        pipeline_keys = {
+            "sources", "models", "seeds", "snapshots", "tests",
+            "schedule", "schedule_interval", "dag_id", "task_id",
+            "operator", "dependencies", "depends_on", "upstream",
+            "tables", "columns", "materialized", "schema", "database",
+            "vars", "config", "tags", "meta", "description",
+        }
+
+        for key, value in data.items():
+            full_key = f"{prefix}.{key}" if prefix else str(key)
+
+            # Find approximate line number for this key
+            line_num = 1
+            key_str = str(key)
+            for i, line in enumerate(lines):
+                if re.match(rf'\s*{re.escape(key_str)}\s*:', line):
+                    line_num = i + 1
+                    break
+
+            is_pipeline_relevant = key.lower() in pipeline_keys or depth == 0
+
+            if is_pipeline_relevant:
+                sig = f"key: {full_key}"
+                if isinstance(value, list):
+                    sig += f" [{len(value)} items]"
+                elif isinstance(value, dict):
+                    sig += f" {{{len(value)} keys}}"
+
+                analysis.functions.append(FunctionInfo(
+                    name=full_key,
+                    signature=sig,
+                    line_start=line_num,
+                    line_end=line_num,
+                    is_public=True,
+                ))
+
+            if isinstance(value, dict):
+                self._extract_yaml_keys(value, full_key, lines, analysis, depth + 1, max_depth)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        self._extract_yaml_keys(
+                            item, full_key, lines, analysis, depth + 1, max_depth,
+                        )
 
     def analyze_directory(self, root: Path) -> list[ModuleAnalysis]:
         """Analyze all files in a directory tree."""

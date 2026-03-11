@@ -184,6 +184,33 @@ class KnowledgeGraph:
             json.dump(self.serialize_lineage_graph(), f, indent=2, default=str)
         logger.info(f"Saved lineage graph to {lineage_graph_path}")
 
+    @classmethod
+    def load_from_directory(cls, input_dir: Path) -> "KnowledgeGraph":
+        """Load a previously saved knowledge graph from a .cartography/ directory."""
+        kg = cls()
+
+        module_graph_path = input_dir / "module_graph.json"
+        if module_graph_path.exists():
+            with open(module_graph_path) as f:
+                data = json.load(f)
+            kg.module_graph = json_graph.node_link_graph(data["graph"])
+            for path, mod_data in data.get("modules", {}).items():
+                kg.data.modules[path] = ModuleNode(**mod_data)
+            logger.info(f"Loaded module graph from {module_graph_path}")
+
+        lineage_graph_path = input_dir / "lineage_graph.json"
+        if lineage_graph_path.exists():
+            with open(lineage_graph_path) as f:
+                data = json.load(f)
+            kg.lineage_graph = json_graph.node_link_graph(data["graph"])
+            for name, ds_data in data.get("datasets", {}).items():
+                kg.data.datasets[name] = DatasetNode(**ds_data)
+            for name, tr_data in data.get("transformations", {}).items():
+                kg.data.transformations[name] = TransformationNode(**tr_data)
+            logger.info(f"Loaded lineage graph from {lineage_graph_path}")
+
+        return kg
+
     def _count_languages(self) -> dict[str, int]:
         """Count files per language."""
         counts: dict[str, int] = {}
