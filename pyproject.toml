@@ -21,6 +21,9 @@ dependencies = [
     "gitpython>=3.1.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
+    # LLM via local Ollama (no SDK needed — uses stdlib urllib)
+    # Run: ollama pull kimi-k2.5:cloud
+    "scikit-learn>=1.4.0",
 ]
 
 [project.scripts]
