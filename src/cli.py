@@ -1,7 +1,10 @@
 """CLI entry point for The Brownfield Cartographer.
 
 Usage:
-    cartographer analyze <repo_path_or_url> [--output <dir>]
+    cartographer analyze <repo_path_or_url> [--output <dir>] [--skip-llm] [--incremental]
+    cartographer query <target> [--skip-llm]
+    cartographer summary <target>
+    cartographer blast-radius <target> <node>
 """
 
 from __future__ import annotations
@@ -44,7 +47,19 @@ def cli(verbose: bool):
     default=None,
     help="Output directory for cartography artifacts (default: <target>/.cartography/)",
 )
-def analyze(target: str, output: str | None):
+@click.option(
+    "--skip-llm",
+    is_flag=True,
+    default=False,
+    help="Skip LLM-powered analysis (Semanticist). Uses static analysis only.",
+)
+@click.option(
+    "--incremental",
+    is_flag=True,
+    default=False,
+    help="Only re-analyze files changed since last run (via git diff).",
+)
+def analyze(target: str, output: str | None, skip_llm: bool, incremental: bool):
     """Analyze a codebase and generate the knowledge graph.
 
     TARGET can be a local path or a GitHub URL.
@@ -53,11 +68,18 @@ def analyze(target: str, output: str | None):
         cartographer analyze ./my-project
         cartographer analyze https://github.com/user/repo
         cartographer analyze /path/to/codebase --output ./results
+        cartographer analyze ./my-project --skip-llm
+        cartographer analyze ./my-project --incremental
     """
     from src.orchestrator import Orchestrator
 
     try:
-        orchestrator = Orchestrator(target_path=target, output_dir=output)
+        orchestrator = Orchestrator(
+            target_path=target,
+            output_dir=output,
+            skip_llm=skip_llm,
+            incremental=incremental,
+        )
         results = orchestrator.run()
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/] {e}")
@@ -68,6 +90,44 @@ def analyze(target: str, output: str | None):
     except KeyboardInterrupt:
         console.print("\n[yellow]Analysis interrupted.[/]")
         sys.exit(130)
+
+
+@cli.command()
+@click.argument("target", type=str)
+@click.option(
+    "--skip-llm",
+    is_flag=True,
+    default=False,
+    help="Skip LLM for explain_module queries.",
+)
+def query(target: str, skip_llm: bool):
+    """Start interactive Navigator query mode.
+
+    TARGET is the path to a previously analyzed codebase (must have .cartography/ dir).
+
+    Examples:
+        cartographer query ./my-project
+        cartographer query /path/to/codebase --skip-llm
+    """
+    from pathlib import Path
+    from src.agents.navigator import NavigatorAgent
+
+    cartography_dir = Path(target).resolve() / ".cartography"
+    repo_path = Path(target).resolve()
+
+    if not cartography_dir.exists():
+        console.print(
+            f"[red]Error:[/] No .cartography/ directory found at {cartography_dir}. "
+            f"Run 'cartographer analyze' first."
+        )
+        sys.exit(1)
+
+    navigator = NavigatorAgent(
+        repo_path=repo_path,
+        cartography_dir=cartography_dir,
+        skip_llm=skip_llm,
+    )
+    navigator.interactive_loop()
 
 
 @cli.command()
@@ -138,6 +198,23 @@ def summary(target: str):
                 console.print(f"  {k}: {v}")
         else:
             console.print(f"[yellow]{fname} not found[/]")
+
+    # Show CODEBASE.md preview
+    codebase_path = cartography_dir / "CODEBASE.md"
+    if codebase_path.exists():
+        content = codebase_path.read_text()
+        lines = content.splitlines()
+        console.print(f"\n[bold]CODEBASE.md:[/] {len(lines)} lines")
+        # Show first 10 lines
+        for line in lines[:10]:
+            console.print(f"  {line}")
+
+    # Show onboarding brief preview
+    brief_path = cartography_dir / "onboarding_brief.md"
+    if brief_path.exists():
+        content = brief_path.read_text()
+        lines = content.splitlines()
+        console.print(f"\n[bold]onboarding_brief.md:[/] {len(lines)} lines")
 
 
 if __name__ == "__main__":
