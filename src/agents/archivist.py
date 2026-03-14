@@ -231,7 +231,14 @@ class ArchivistAgent:
                 "Modules where the docstring appears to contradict the implementation:"
             )
             for path, issue in list(drift.items())[:10]:
-                lines.append(f"- `{path}`: {issue}")
+                if isinstance(issue, dict):
+                    severity = issue.get("severity", "low")
+                    contradiction = issue.get("contradiction", str(issue))
+                    stale = issue.get("stale_references", [])
+                    stale_str = f" (stale refs: `{'`, `'.join(stale[:3])}`)"
+                    lines.append(f"- `{path}` [{severity.upper()}]: {contradiction}{stale_str if stale else ''}")
+                else:
+                    lines.append(f"- `{path}`: {issue}")
         else:
             lines.append("No drift detected (or LLM analysis not performed). ✅")
 
@@ -371,7 +378,16 @@ class ArchivistAgent:
 
         sections.append(f"- **Circular dependencies:** {len(circular)}")
         sections.append(f"- **Dead code candidates:** {len(dead)}")
-        sections.append(f"- **Documentation drift flags:** {len(drift)}")
+        if drift:
+            # Show count and highest severity
+            high = sum(1 for v in drift.values() if isinstance(v, dict) and v.get("severity") == "high")
+            med = sum(1 for v in drift.values() if isinstance(v, dict) and v.get("severity") == "medium")
+            sections.append(
+                f"- **Documentation drift flags:** {len(drift)} "
+                f"(🔴 high: {high}, 🟡 medium: {med})"
+            )
+        else:
+            sections.append("- **Documentation drift flags:** 0")
 
         # Budget summary
         budget = semanticist_results.get("budget_summary", {})

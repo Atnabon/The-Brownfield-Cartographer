@@ -185,16 +185,29 @@ class HydrologistAgent:
                     ))
 
     def _analyze_python_data_ops(self, file_analyses: list[ModuleAnalysis]):
-        """Find data read/write operations in Python files."""
-        # Patterns for data operations
+        """Find data read/write operations in Python files.
+
+        Detects pandas, PySpark, and SQLAlchemy patterns. Logs dynamic
+        references (variable-based paths) that cannot be statically resolved.
+        Edges carry transformation_type, source_file, and line_range metadata.
+        """
+        # Patterns: (regex, op_type, storage_type)
         read_patterns = [
             (r'pd\.read_csv\s*\(\s*["\']([^"\']+)["\']', "pandas_read_csv", StorageType.FILE),
             (r'pd\.read_sql\s*\(\s*["\']([^"\']+)["\']', "pandas_read_sql", StorageType.TABLE),
+            (r'pd\.read_sql_query\s*\(\s*["\']([^"\']+)["\']', "pandas_read_sql_query", StorageType.TABLE),
+            (r'pd\.read_sql_table\s*\(\s*["\']([^"\']+)["\']', "pandas_read_sql_table", StorageType.TABLE),
             (r'pd\.read_parquet\s*\(\s*["\']([^"\']+)["\']', "pandas_read_parquet", StorageType.FILE),
             (r'pd\.read_excel\s*\(\s*["\']([^"\']+)["\']', "pandas_read_excel", StorageType.FILE),
             (r'spark\.read\.\w+\(\s*["\']([^"\']+)["\']', "spark_read", StorageType.FILE),
             (r'\.read_table\s*\(\s*["\']([^"\']+)["\']', "read_table", StorageType.TABLE),
             (r'open\s*\(\s*["\']([^"\']+)["\']', "file_open", StorageType.FILE),
+            # SQLAlchemy ORM patterns
+            (r'session\.execute\s*\(\s*(?:text|select)\s*\(\s*["\']([^"\']+)["\']',
+             "sqlalchemy_execute", StorageType.TABLE),
+            (r'Table\s*\(\s*["\']([^"\']+)["\']', "sqlalchemy_table_ref", StorageType.TABLE),
+            (r'engine\.execute\s*\(\s*["\']([^"\']+)["\']', "sqlalchemy_engine_execute", StorageType.TABLE),
+            (r'pd\.read_sql_query\s*\(\s*\"""([^\"]+)\"""\.', "pandas_read_sql_multiline", StorageType.TABLE),
         ]
 
         write_patterns = [
@@ -203,6 +216,17 @@ class HydrologistAgent:
             (r'\.to_sql\s*\(\s*["\']([^"\']+)["\']', "pandas_to_sql", StorageType.TABLE),
             (r'\.write\.\w+\(\s*["\']([^"\']+)["\']', "spark_write", StorageType.FILE),
             (r'\.to_excel\s*\(\s*["\']([^"\']+)["\']', "pandas_to_excel", StorageType.FILE),
+            # SQLAlchemy ORM write patterns
+            (r'session\.add\s*\(\s*(\w+)\s*\)', "sqlalchemy_session_add", StorageType.TABLE),
+            (r'Table\s*\(\s*["\']([^"\']+)["\'].*metadata.*create', "sqlalchemy_create_table", StorageType.TABLE),
+        ]
+
+        # Dynamic reference indicators: these patterns cannot yield a static name
+        dynamic_read_indicators = [
+            r'pd\.read_\w+\s*\(\s*[a-z_][a-z_0-9]*\s*[,)]',   # pd.read_csv(path_var)
+            r'spark\.read\.\w+\(\s*[a-z_][a-z_0-9]*\s*[,)]',  # spark.read.parquet(path_var)
+            r'open\s*\(\s*[a-z_][a-z_0-9]*\s*[,)]',            # open(filename_var)
+            r'session\.query\s*\(\s*\w+\s*\)',                  # session.query(Model)
         ]
 
         for analysis in file_analyses:
@@ -215,66 +239,85 @@ class HydrologistAgent:
                 continue
 
             rel_path = self._relative_path(analysis.path)
-            sources_found = []
-            targets_found = []
+            # List of (dataset_name, line_number)
+            sources_found: list[tuple[str, int]] = []
+            targets_found: list[tuple[str, int]] = []
 
             for pattern, op_type, storage_type in read_patterns:
                 for match in re.finditer(pattern, content):
                     dataset_name = match.group(1)
+                    line_no = content[: match.start()].count("\n") + 1
                     if dataset_name not in self.datasets:
                         self.datasets[dataset_name] = DatasetNode(
                             name=dataset_name,
                             storage_type=storage_type,
                         )
                         self.lineage_graph.add_node(dataset_name, node_type="dataset")
-                    sources_found.append(dataset_name)
+                    sources_found.append((dataset_name, line_no))
 
             for pattern, op_type, storage_type in write_patterns:
                 for match in re.finditer(pattern, content):
                     dataset_name = match.group(1)
+                    line_no = content[: match.start()].count("\n") + 1
                     if dataset_name not in self.datasets:
                         self.datasets[dataset_name] = DatasetNode(
                             name=dataset_name,
                             storage_type=storage_type,
                         )
                         self.lineage_graph.add_node(dataset_name, node_type="dataset")
-                    targets_found.append(dataset_name)
+                    targets_found.append((dataset_name, line_no))
+
+            # Log dynamic (unresolvable) dataset references
+            for dyn_pattern in dynamic_read_indicators:
+                for dyn_match in re.finditer(dyn_pattern, content):
+                    dyn_line = content[: dyn_match.start()].count("\n") + 1
+                    logger.debug(
+                        f"Hydrologist: Dynamic reference at {rel_path}:{dyn_line} — "
+                        f"cannot statically resolve dataset name from variable: "
+                        f"{dyn_match.group(0)[:60]!r}"
+                    )
 
             if sources_found or targets_found:
                 transform_name = f"python:{rel_path}"
+                src_names = [s for s, _ in sources_found]
+                tgt_names = [t for t, _ in targets_found]
                 self.transformations[transform_name] = TransformationNode(
                     name=transform_name,
-                    source_datasets=sources_found,
-                    target_datasets=targets_found,
+                    source_datasets=src_names,
+                    target_datasets=tgt_names,
                     transformation_type=TransformationType.PYTHON_TRANSFORM,
                     source_file=rel_path,
                 )
                 self.lineage_graph.add_node(transform_name, node_type="transformation")
 
-                for src in sources_found:
+                for src, src_line in sources_found:
                     self.lineage_graph.add_edge(
                         src, transform_name,
                         transformation_type="python_transform",
                         source_file=rel_path,
+                        line_range=(src_line, src_line),
                     )
                     self.edges.append(GraphEdge(
                         source=src, target=transform_name, edge_type=EdgeType.CONSUMES,
                         metadata={
                             "transformation_type": "python_transform",
                             "source_file": rel_path,
+                            "line_range": [src_line, src_line],
                         },
                     ))
-                for tgt in targets_found:
+                for tgt, tgt_line in targets_found:
                     self.lineage_graph.add_edge(
                         transform_name, tgt,
                         transformation_type="python_transform",
                         source_file=rel_path,
+                        line_range=(tgt_line, tgt_line),
                     )
                     self.edges.append(GraphEdge(
                         source=transform_name, target=tgt, edge_type=EdgeType.PRODUCES,
                         metadata={
                             "transformation_type": "python_transform",
                             "source_file": rel_path,
+                            "line_range": [tgt_line, tgt_line],
                         },
                     ))
 
