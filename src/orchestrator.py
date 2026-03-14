@@ -154,7 +154,12 @@ class Orchestrator:
         ) as progress:
             task = progress.add_task("Analyzing module structure...", total=None)
             surveyor = SurveyorAgent(self.target_path)
-            surveyor_results = surveyor.run()
+            try:
+                surveyor_results = surveyor.run()
+            except Exception as exc:
+                self._serialize_outputs()
+                self._save_trace_log()
+                raise RuntimeError(f"Surveyor phase failed: {exc}") from exc
             progress.update(task, description="[green]Module structure analysis complete!")
 
         self._log_action("surveyor_complete", {
@@ -162,7 +167,7 @@ class Orchestrator:
             "edges_found": len(surveyor_results["edges"]),
             "circular_deps": len(surveyor_results["circular_dependencies"]),
             "dead_code": len(surveyor_results["dead_code_candidates"]),
-        })
+        }, confidence=0.95, analysis_method="static")
 
         self._print_surveyor_summary(surveyor_results, surveyor)
 
@@ -175,7 +180,13 @@ class Orchestrator:
         ) as progress:
             task = progress.add_task("Analyzing data lineage...", total=None)
             hydrologist = HydrologistAgent(self.target_path)
-            hydrologist_results = hydrologist.run(surveyor.file_analyses)
+            try:
+                hydrologist_results = hydrologist.run(surveyor.file_analyses)
+            except Exception as exc:
+                self.knowledge_graph.merge_surveyor_results(surveyor_results)
+                self._serialize_outputs()
+                self._save_trace_log()
+                raise RuntimeError(f"Hydrologist phase failed: {exc}") from exc
             progress.update(task, description="[green]Data lineage analysis complete!")
 
         self._log_action("hydrologist_complete", {
@@ -183,7 +194,7 @@ class Orchestrator:
             "transformations_found": len(hydrologist_results["transformations"]),
             "sources": hydrologist_results["sources"],
             "sinks": hydrologist_results["sinks"],
-        })
+        }, confidence=0.85, analysis_method="static")
 
         self._print_hydrologist_summary(hydrologist_results)
 
@@ -197,18 +208,27 @@ class Orchestrator:
             task = progress.add_task("Generating purpose statements...", total=None)
             from src.agents.semanticist import SemanticistAgent
             semanticist = SemanticistAgent(self.target_path, skip_llm=self.skip_llm)
-            semanticist_results = semanticist.run(
-                surveyor_results["modules"],
-                surveyor_results,
-                hydrologist_results,
-            )
+            try:
+                semanticist_results = semanticist.run(
+                    surveyor_results["modules"],
+                    surveyor_results,
+                    hydrologist_results,
+                )
+            except Exception as exc:
+                self.knowledge_graph.merge_surveyor_results(surveyor_results)
+                self.knowledge_graph.merge_hydrologist_results(hydrologist_results)
+                self._serialize_outputs()
+                self._save_trace_log()
+                raise RuntimeError(f"Semanticist phase failed: {exc}") from exc
             progress.update(task, description="[green]Semantic analysis complete!")
 
+        llm_used = bool(semanticist_results.get("budget_summary", {}).get("total_calls", 0))
         self._log_action("semanticist_complete", {
             "purpose_statements": len(semanticist_results["purpose_statements"]),
             "doc_drift_flags": len(semanticist_results["doc_drift_flags"]),
             "budget": semanticist_results.get("budget_summary", {}),
-        })
+        }, confidence=0.80 if llm_used else 0.65,
+           analysis_method="llm" if llm_used else "static")
 
         self._print_semanticist_summary(semanticist_results)
 
@@ -231,18 +251,22 @@ class Orchestrator:
             task = progress.add_task("Generating CODEBASE.md and onboarding brief...", total=None)
             from src.agents.archivist import ArchivistAgent
             archivist = ArchivistAgent(self.target_path, self.output_dir)
-            archivist_results = archivist.run(
-                surveyor_results["modules"],
-                surveyor_results,
-                hydrologist_results,
-                semanticist_results,
-            )
+            try:
+                archivist_results = archivist.run(
+                    surveyor_results["modules"],
+                    surveyor_results,
+                    hydrologist_results,
+                    semanticist_results,
+                )
+            except Exception as exc:
+                self._save_trace_log()
+                raise RuntimeError(f"Archivist phase failed: {exc}") from exc
             progress.update(task, description="[green]Artifacts generated!")
 
         self._log_action("archivist_complete", {
             "codebase_md_length": archivist_results.get("codebase_md_length", 0),
             "onboarding_brief_length": archivist_results.get("onboarding_brief_length", 0),
-        })
+        }, confidence=0.99, analysis_method="static")
 
         # Save trace log (includes all phases)
         self._save_trace_log()
@@ -251,7 +275,7 @@ class Orchestrator:
         self._log_action("pipeline_complete", {
             "elapsed_seconds": elapsed,
             "timestamp": datetime.now().isoformat(),
-        })
+        }, confidence=1.0, analysis_method="static")
         self._save_trace_log()  # Save again with pipeline_complete
 
         summary = self.knowledge_graph.get_summary()
@@ -369,12 +393,25 @@ class Orchestrator:
                 f.write(json.dumps(entry, default=str) + "\n")
         logger.info(f"Saved trace log to {trace_path}")
 
-    def _log_action(self, action: str, details: dict):
-        """Log an action to the trace log."""
+    def _log_action(self, action: str, details: dict,
+                    confidence: float | None = None,
+                    analysis_method: str | None = None):
+        """Log an action to the trace log.
+
+        Args:
+            action: Action identifier string.
+            details: Arbitrary details dict.
+            confidence: Optional 0.0-1.0 confidence level for this analysis step.
+            analysis_method: Optional 'static', 'llm', or 'hybrid' method label.
+        """
         entry = {
             "timestamp": datetime.now().isoformat(),
             "action": action,
             "details": details,
         }
+        if confidence is not None:
+            entry["confidence_level"] = round(confidence, 4)
+        if analysis_method is not None:
+            entry["analysis_method"] = analysis_method
         self.trace_log.append(entry)
         logger.debug(f"TRACE: {action} - {details}")
